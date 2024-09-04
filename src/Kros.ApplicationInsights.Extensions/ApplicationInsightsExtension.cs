@@ -55,7 +55,7 @@ namespace Microsoft.Extensions.DependencyInjection
 
             if (options != null)
             {
-                builder.UseSampling(options.SamplingRate);
+                builder.UseSampling(options.SamplingRate, options.ExcludedTypes, options.IncludedTypes);
 
                 if (options.AdaptiveSamplingOptions != null)
                 {

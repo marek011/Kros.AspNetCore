@@ -13,6 +13,19 @@ namespace Microsoft.Extensions.DependencyInjection.Options
         public string ServiceName { get; set; }
 
         /// <summary>
+        /// Semicolon separated list of types that should not be sampled when using fixed rate sampling.
+        /// Allowed type names: Dependency, Event, Exception, PageView, Request, Trace.
+        /// </summary>
+        public string ExcludedTypes { get; set; }
+
+        /// <summary>
+        /// Semicolon separated list of types that should be sampled when using fixed rate sampling.
+        /// All types are sampled when left empty. Allowed type names: Dependency,
+        /// Event, Exception, PageView, Request, Trace.
+        /// </summary>
+        public string IncludedTypes { get; set; }
+
+        /// <summary>
         /// Sampling rate for fixed rate sampling.
         /// Must be a number 100/N, where N is integer.(100,50,25,...,0.1....)
         /// </summary>
