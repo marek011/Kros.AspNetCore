@@ -50,18 +50,18 @@ namespace Kros.AspNetCore.Authorization
         /// </summary>
         /// <param name="httpContext">Http context.</param>
         /// <param name="httpClientFactory">Http client factory.</param>
-        /// <param name="memoryCache">Cache for caching authorization token.</param>
+        /// <param name="cacheService">Cache service for caching authorization token.</param>
         /// <param name="serviceDiscoveryProvider">The service discovery provider.</param>
         public async Task Invoke(
             HttpContext httpContext,
             IHttpClientFactory httpClientFactory,
-            IMemoryCache memoryCache,
+            ICacheService cacheService,
             IServiceDiscoveryProvider serviceDiscoveryProvider)
         {
             string userJwt = await GetUserAuthorizationJwtAsync(
                 httpContext,
                 httpClientFactory,
-                memoryCache,
+                cacheService,
                 serviceDiscoveryProvider);
 
             if (!string.IsNullOrEmpty(userJwt))
@@ -75,7 +75,7 @@ namespace Kros.AspNetCore.Authorization
         private async Task<string> GetUserAuthorizationJwtAsync(
             HttpContext httpContext,
             IHttpClientFactory httpClientFactory,
-            IMemoryCache memoryCache,
+            ICacheService cacheService,
             IServiceDiscoveryProvider serviceDiscoveryProvider)
         {
             if (JwtAuthorizationHelper.TryGetTokenValue(httpContext.Request.Headers, out string token))
@@ -89,54 +89,85 @@ namespace Kros.AspNetCore.Authorization
                 {
                     cacheKeyPart += urlPathForCache;
                 }
-                int key = GetKey(token, cacheKeyPart);
+                string cacheKey = GetKeyAsString(token, cacheKeyPart);
 
-                if (!memoryCache.TryGetValue(key, out string jwtToken))
+                if (IsCacheAllowed() && !IsRequestPathAllowedForCache(httpContext.Request))
                 {
-                    string authUrl =
-                        _jwtAuthorizationOptions.GetAuthorizationUrl(serviceDiscoveryProvider) + httpContext.Request.Path.Value;
-                    jwtToken = await GetUserAuthorizationJwtAsync(
+                    string jwtToken = await cacheService.GetOrSetAsync(
+                        cacheKey,
+                        async () =>
+                        {
+                            string authUrl = _jwtAuthorizationOptions.GetAuthorizationUrl(serviceDiscoveryProvider) + httpContext.Request.Path.Value;
+                            return await GetUserAuthorizationJwtFromServiceAsync(
+                                httpContext,
+                                httpClientFactory,
+                                token,
+                                authUrl);
+                        },
+                        _jwtAuthorizationOptions.CacheAbsoluteExpiration != TimeSpan.Zero ? _jwtAuthorizationOptions.CacheAbsoluteExpiration : null,
+                        _jwtAuthorizationOptions.CacheSlidingExpirationOffset != TimeSpan.Zero ? _jwtAuthorizationOptions.CacheSlidingExpirationOffset : null);
+
+                    return jwtToken;
+                }
+                else
+                {
+                    // Cache is disabled or path is ignored, get token directly
+                    string authUrl = _jwtAuthorizationOptions.GetAuthorizationUrl(serviceDiscoveryProvider) + httpContext.Request.Path.Value;
+                    return await GetUserAuthorizationJwtFromServiceAsync(
                         httpContext,
                         httpClientFactory,
-                        memoryCache,
                         token,
-                        key,
                         authUrl);
                 }
-
-                return jwtToken;
             }
             else if (!string.IsNullOrEmpty(_jwtAuthorizationOptions.HashParameterName)
                 && httpContext.Request.Query.TryGetValue(_jwtAuthorizationOptions.HashParameterName, out StringValues hashValue))
             {
-                int key = GetKey(hashValue.ToString());
-                if (!memoryCache.TryGetValue(key, out string jwtToken))
+                string cacheKey = GetKeyAsString(hashValue.ToString());
+                
+                if (IsCacheAllowed() && !IsRequestPathAllowedForCache(httpContext.Request))
                 {
+                    string jwtToken = await cacheService.GetOrSetAsync(
+                        cacheKey,
+                        async () =>
+                        {
+                            UriBuilder uriBuilder = new(_jwtAuthorizationOptions.GetHashAuthorization(serviceDiscoveryProvider));
+                            uriBuilder.Query = QueryString.Create(
+                                _jwtAuthorizationOptions.HashParameterName,
+                                hashValue.ToString()).ToUriComponent();
+                            return await GetUserAuthorizationJwtFromServiceAsync(
+                                httpContext,
+                                httpClientFactory,
+                                StringValues.Empty,
+                                uriBuilder.Uri.ToString());
+                        },
+                        _jwtAuthorizationOptions.CacheAbsoluteExpiration != TimeSpan.Zero ? _jwtAuthorizationOptions.CacheAbsoluteExpiration : null,
+                        _jwtAuthorizationOptions.CacheSlidingExpirationOffset != TimeSpan.Zero ? _jwtAuthorizationOptions.CacheSlidingExpirationOffset : null);
+
+                    return jwtToken;
+                }
+                else
+                {
+                    // Cache is disabled or path is ignored, get token directly
                     UriBuilder uriBuilder = new(_jwtAuthorizationOptions.GetHashAuthorization(serviceDiscoveryProvider));
                     uriBuilder.Query = QueryString.Create(
                         _jwtAuthorizationOptions.HashParameterName,
                         hashValue.ToString()).ToUriComponent();
-                    jwtToken = await GetUserAuthorizationJwtAsync(
+                    return await GetUserAuthorizationJwtFromServiceAsync(
                         httpContext,
                         httpClientFactory,
-                        memoryCache,
                         StringValues.Empty,
-                        key,
                         uriBuilder.Uri.ToString());
                 }
-
-                return jwtToken;
             }
 
             return string.Empty;
         }
 
-        private async Task<string> GetUserAuthorizationJwtAsync(
+        private async Task<string> GetUserAuthorizationJwtFromServiceAsync(
             HttpContext httpContext,
             IHttpClientFactory httpClientFactory,
-            IMemoryCache memoryCache,
             StringValues authHeader,
-            int cacheKey,
             string authorizationUrl)
         {
             using (HttpClient client = httpClientFactory.CreateClient(AuthorizationHttpClientName))
@@ -152,7 +183,6 @@ namespace Kros.AspNetCore.Authorization
 
                 string jwtToken = await client.GetStringAndCheckResponseAsync(authorizationUrl,
                     new UnauthorizedAccessException(Properties.Resources.AuthorizationServiceForbiddenRequest));
-                SetTokenToCache(memoryCache, cacheKey, jwtToken, httpContext.Request);
 
                 return jwtToken;
             }
@@ -166,25 +196,6 @@ namespace Kros.AspNetCore.Authorization
                 {
                     client.DefaultRequestHeaders.Add(headerName, (IEnumerable<string>)value);
                 }
-            }
-        }
-
-        private void SetTokenToCache(IMemoryCache memoryCache, int key, string jwtToken, HttpRequest request)
-        {
-            if (IsCacheAllowed() && !IsRequestPathAllowedForCache(request))
-            {
-                MemoryCacheEntryOptions cacheEntryOptions = new();
-
-                if (_jwtAuthorizationOptions.CacheSlidingExpirationOffset != TimeSpan.Zero)
-                {
-                    cacheEntryOptions.SetSlidingExpiration(_jwtAuthorizationOptions.CacheSlidingExpirationOffset);
-                }
-                if (_jwtAuthorizationOptions.CacheAbsoluteExpiration != TimeSpan.Zero)
-                {
-                    cacheEntryOptions.SetAbsoluteExpiration(_jwtAuthorizationOptions.CacheAbsoluteExpiration);
-                }
-
-                memoryCache.Set(key, jwtToken, cacheEntryOptions);
             }
         }
 
@@ -212,6 +223,9 @@ namespace Kros.AspNetCore.Authorization
 
         internal static int GetKey(StringValues value, string additionalKeyPart = null)
             => (additionalKeyPart is null) ? HashCode.Combine(value) : HashCode.Combine(value, additionalKeyPart);
+
+        internal static string GetKeyAsString(StringValues value, string additionalKeyPart = null)
+            => GetKey(value, additionalKeyPart).ToString();
 
         private static void AddUserProfileClaimsToIdentityAndHttpHeaders(HttpContext httpContext, string userJwtToken)
             => httpContext.Request.Headers[HeaderNames.Authorization] = $"{JwtAuthorizationHelper.AuthTokenPrefix} {userJwtToken}";

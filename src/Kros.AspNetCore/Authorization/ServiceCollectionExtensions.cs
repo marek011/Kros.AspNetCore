@@ -1,6 +1,7 @@
 ﻿using Kros.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.IdentityModel.Tokens;
@@ -22,10 +23,78 @@ namespace Kros.AspNetCore.Authorization
         /// </summary>
         /// <param name="services">Collection of app services.</param>
         public static IServiceCollection AddGatewayJwtAuthorization(this IServiceCollection services)
-            => services
-            .AddMemoryCache()
-            .AddHttpClient(GatewayAuthorizationMiddleware.AuthorizationHttpClientName)
-            .Services;
+        {
+            services.AddMemoryCache();
+            services.AddHttpClient(GatewayAuthorizationMiddleware.AuthorizationHttpClientName);
+            
+            // Register ICacheService with fallback logic
+            services.AddSingleton<ICacheService>(serviceProvider =>
+            {
+                // Try to get FusionCache first (user can register it optionally)
+                // Look for IFusionCache interface
+                var fusionCacheType = AppDomain.CurrentDomain.GetAssemblies()
+                    .SelectMany(a => a.GetTypes())
+                    .FirstOrDefault(t => t.Name == "IFusionCache");
+
+                if (fusionCacheType != null)
+                {
+                    var fusionCache = serviceProvider.GetService(fusionCacheType);
+                    if (fusionCache != null)
+                    {
+                        return new FusionCacheService(fusionCache);
+                    }
+                }
+
+                // Fallback to MemoryCache
+                var memoryCache = serviceProvider.GetRequiredService<IMemoryCache>();
+                return new MemoryCacheService(memoryCache);
+            });
+
+            return services;
+        }
+
+        /// <summary>
+        /// Configure gateway authorization with a custom cache service.
+        /// </summary>
+        /// <param name="services">Collection of app services.</param>
+        /// <param name="cacheServiceFactory">Factory to create custom cache service.</param>
+        public static IServiceCollection AddGatewayJwtAuthorization(this IServiceCollection services, Func<IServiceProvider, ICacheService> cacheServiceFactory)
+        {
+            services.AddHttpClient(GatewayAuthorizationMiddleware.AuthorizationHttpClientName);
+            services.AddSingleton(cacheServiceFactory);
+            return services;
+        }
+
+        /// <summary>
+        /// Configure gateway authorization to use FusionCache.
+        /// Note: FusionCache must be registered separately in the DI container.
+        /// </summary>
+        /// <param name="services">Collection of app services.</param>
+        public static IServiceCollection AddGatewayJwtAuthorizationWithFusionCache(this IServiceCollection services)
+        {
+            services.AddHttpClient(GatewayAuthorizationMiddleware.AuthorizationHttpClientName);
+            
+            services.AddSingleton<ICacheService>(serviceProvider =>
+            {
+                // Try to get FusionCache from DI container
+                var fusionCacheType = AppDomain.CurrentDomain.GetAssemblies()
+                    .SelectMany(a => a.GetTypes())
+                    .FirstOrDefault(t => t.Name == "IFusionCache");
+
+                if (fusionCacheType != null)
+                {
+                    var fusionCache = serviceProvider.GetService(fusionCacheType);
+                    if (fusionCache != null)
+                    {
+                        return new FusionCacheService(fusionCache);
+                    }
+                }
+
+                throw new InvalidOperationException("FusionCache is not registered in the DI container. Please register FusionCache first or use AddGatewayJwtAuthorization() for MemoryCache fallback.");
+            });
+
+            return services;
+        }
 
         /// <summary>
         /// Configure downstream api authentication.
